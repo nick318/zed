@@ -3,7 +3,7 @@ use editor::Editor;
 use fuzzy_nucleo::StringMatchCandidate;
 
 use collections::{HashMap, HashSet};
-use git::repository::{Branch, delete_branch_flag};
+use git::repository::{Branch, Worktree as GitWorktree, delete_branch_flag};
 use git::{GitHostingProviderRegistry, parse_git_remote_url};
 use gpui::http_client::Url;
 use gpui::{
@@ -16,6 +16,7 @@ use project::git_store::{Repository, RepositoryEvent};
 use project::project_settings::ProjectSettings;
 use settings::Settings;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use ui::{
@@ -654,6 +655,23 @@ fn branch_filter_menu(
         }
         menu
     })
+}
+
+fn linked_worktree_for_branch(
+    repo: &Repository,
+    branch_ref_name: &SharedString,
+) -> Option<(GitWorktree, PathBuf)> {
+    let linked_worktrees = repo.linked_worktrees();
+    let worktree = linked_worktrees
+        .iter()
+        .find(|worktree| worktree.ref_name.as_ref() == Some(branch_ref_name))?
+        .clone();
+    let name_anchor = linked_worktrees
+        .iter()
+        .find(|worktree| worktree.is_main)
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| repo.work_directory_abs_path.to_path_buf());
+    Some((worktree, name_anchor))
 }
 
 pub struct BranchListDelegate {
@@ -1564,6 +1582,26 @@ impl PickerDelegate for BranchListDelegate {
                 let Some(repo) = self.repo.clone() else {
                     return;
                 };
+
+                // Git refuses to check out a branch that another worktree already has
+                // checked out, so switch the workspace to that worktree instead.
+                if let Some((worktree, name_anchor)) =
+                    linked_worktree_for_branch(repo.read(cx), &branch.ref_name)
+                {
+                    let switch = zed_actions::SwitchWorktree {
+                        path: worktree.path.clone(),
+                        display_name: worktree.directory_name(Some(&name_anchor)),
+                    };
+                    self.workspace
+                        .update(cx, |workspace, cx| {
+                            git_ui_core::worktree_service::handle_switch_worktree(
+                                workspace, &switch, window, None, cx,
+                            );
+                        })
+                        .log_err();
+                    cx.emit(DismissEvent);
+                    return;
+                }
 
                 let branch = branch.clone();
                 cx.spawn(async move |_, cx| {
@@ -2581,6 +2619,65 @@ mod tests {
                 assert_eq!(branches, expected_branches);
             })
         });
+    }
+
+    #[gpui::test]
+    async fn test_checkout_branch_in_linked_worktree_switches_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, _project, repository) = init_fake_repository_with_fs(cx).await;
+
+        let worktree_path = PathBuf::from(path!("/worktrees/feature-auth"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "feature-auth".to_string(),
+                        base_sha: Some("deadbeef".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        cx.run_until_parked();
+
+        repository.read_with(cx, |repository, _| {
+            let (worktree, _) =
+                linked_worktree_for_branch(repository, &"refs/heads/feature-auth".into())
+                    .expect("branch checked out in a linked worktree");
+            assert_eq!(worktree.path, worktree_path);
+            assert!(linked_worktree_for_branch(repository, &"refs/heads/main".into()).is_none());
+        });
+
+        let branch_before = repository.read_with(cx, |repository, _| repository.branch.clone());
+
+        let branches = create_test_branches();
+        let (branch_list, mut ctx) =
+            init_branch_list_test(Some(repository.clone()), branches, cx).await;
+        let cx = &mut ctx;
+        update_branch_list_matches_with_empty_query(&branch_list, cx).await;
+
+        branch_list.update_in(cx, |branch_list, window, cx| {
+            branch_list.picker.update(cx, |picker, cx| {
+                let index = picker
+                    .delegate
+                    .matches
+                    .iter()
+                    .position(|entry| entry.name() == "feature-auth")
+                    .unwrap();
+                picker.delegate.set_selected_index(index, window, cx);
+                picker.delegate.confirm(false, window, cx);
+            })
+        });
+        cx.run_until_parked();
+
+        let branch_after = repository.read_with(cx, |repository, _| repository.branch.clone());
+        assert_eq!(
+            branch_after, branch_before,
+            "the current worktree must not check out a branch owned by another worktree"
+        );
     }
 
     #[gpui::test]
