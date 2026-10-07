@@ -1,6 +1,7 @@
 use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
+    git_panel::GitStatusEntry,
     project_diff::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
@@ -378,6 +379,24 @@ impl BranchDiff {
 
     pub(crate) fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
         self.diff.read(cx).repo(cx)
+    }
+
+    pub(crate) fn buffers(&self, cx: &App) -> Entity<diff_buffer_list::DiffBufferList> {
+        self.diff.read(cx).branch_diff().clone()
+    }
+
+    pub(crate) fn move_to_entry(
+        &mut self,
+        entry: GitStatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_entry(entry, window, cx));
+    }
+
+    pub(crate) fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
+        self.diff.read(cx).calculate_changed_lines(cx)
     }
 
     fn set_merge_base(&mut self, base_ref: SharedString, cx: &mut Context<Self>) {
