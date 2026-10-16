@@ -97,7 +97,7 @@ use ui::{
     ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar,
     prelude::*,
 };
-use util::paths::PathStyle;
+use util::paths::{PathMatcher, PathStyle};
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
 use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
@@ -166,6 +166,10 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Focuses the changed files filter.
+        FocusFilter,
+        /// Clears the changed files filter, or focuses the changes list when it is empty.
+        ClearFilter,
     ]
 );
 
@@ -839,6 +843,36 @@ impl MarkedDirectoryCoverage {
     }
 }
 
+/// Narrows the changes list to the files whose path matches the query, like the
+/// file filter of a GitHub pull request: plain text matches any part of the path
+/// (case-insensitively), and text with glob characters is matched as a glob.
+enum ChangesFilter {
+    Substring(String),
+    Glob(PathMatcher),
+}
+
+impl ChangesFilter {
+    fn new(query: &str, path_style: PathStyle) -> Option<Self> {
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        if query.contains(['*', '?', '[', '{'])
+            && let Ok(matcher) = PathMatcher::new([query], path_style)
+        {
+            return Some(Self::Glob(matcher));
+        }
+        Some(Self::Substring(query.to_lowercase()))
+    }
+
+    fn matches(&self, path: &RepoPath) -> bool {
+        match self {
+            Self::Substring(query) => path.as_unix_str().to_lowercase().contains(query.as_str()),
+            Self::Glob(matcher) => matcher.is_match(path.as_ref().as_ref()),
+        }
+    }
+}
+
 enum GitPanelViewMode {
     Flat,
     Tree(TreeViewState),
@@ -1208,6 +1242,8 @@ pub struct GitPanel {
     changes_actions_menu_handle: PopoverMenuHandle<ContextMenu>,
     remote_action_menu_handle: PopoverMenuHandle<ContextMenu>,
     branch_review: Option<BranchReview>,
+    filter_editor: Entity<Editor>,
+    changes_filter: Option<ChangesFilter>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1426,6 +1462,18 @@ impl GitPanel {
                 commit_message_editor(temporary_buffer, None, project.clone(), true, window, cx)
             });
 
+            let filter_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Filter changed files (e.g. *.sql)…", window, cx);
+                editor
+            });
+            cx.subscribe_in(&filter_editor, window, |this, _, event, window, cx| {
+                if let editor::EditorEvent::BufferEdited = event {
+                    this.update_changes_filter(window, cx);
+                }
+            })
+            .detach();
+
             let scroll_handle = UniformListScrollHandle::new();
 
             let mut was_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
@@ -1561,6 +1609,8 @@ impl GitPanel {
                 changes_actions_menu_handle: PopoverMenuHandle::default(),
                 remote_action_menu_handle: PopoverMenuHandle::default(),
                 branch_review: None,
+                filter_editor,
+                changes_filter: None,
             };
 
             this.set_branch_review(initial_branch_diff, window, cx);
@@ -2181,6 +2231,8 @@ impl GitPanel {
 
         if self.commit_editor.read(cx).is_focused(window) {
             dispatch_context.add("CommitEditor");
+        } else if self.filter_editor.read(cx).is_focused(window) {
+            dispatch_context.add("GitPanelFilter");
         } else if self.focus_handle.contains_focused(window, cx) || self.context_menu.is_some() {
             // Preserve the panel's list context while a context menu is open.
             // Its focus handle may not appear as a descendant of the panel
@@ -2645,6 +2697,36 @@ impl GitPanel {
     ) {
         self.focus_handle.focus(window, cx);
         self.select_first_entry_if_none(window, cx);
+    }
+
+    fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab != GitPanelTab::Changes {
+            self.set_active_tab(GitPanelTab::Changes, window, cx);
+        }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+        window.focus(&self.filter_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn clear_filter(&mut self, _: &ClearFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_editor.read(cx).text(cx).is_empty() {
+            self.focus_handle.focus(window, cx);
+            self.select_first_entry_if_none(window, cx);
+        } else {
+            self.filter_editor
+                .update(cx, |editor, cx| editor.set_text("", window, cx));
+        }
+    }
+
+    fn update_changes_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path_style = self.project.read(cx).path_style(cx);
+        let query = self.filter_editor.read(cx).text(cx);
+        self.changes_filter = ChangesFilter::new(&query, path_style);
+        self.clear_marks();
+        self.update_visible_entries(window, cx);
+        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
     }
 
     fn get_selected_entry(&self) -> Option<&GitListEntry> {
@@ -5893,6 +5975,14 @@ impl GitPanel {
             ]
         };
 
+        let mut section_entries = section_entries;
+        let is_filtered = self.changes_filter.is_some();
+        if let Some(filter) = self.changes_filter.as_ref() {
+            for (_, entries) in &mut section_entries {
+                entries.retain(|entry| filter.matches(&entry.repo_path));
+            }
+        }
+
         // Keep Staged/Unstaged headers pinned even when empty (as long as there's
         // anything to show at all) so the layout stays stable while staging.
         let has_any_section_entries = section_entries
@@ -5905,6 +5995,7 @@ impl GitPanel {
         );
         let show_when_empty = |section: Section| {
             group_by_staging_state
+                && !is_filtered
                 && has_any_section_entries
                 && matches!(section, Section::Staged | Section::Unstaged)
         };
@@ -5961,9 +6052,11 @@ impl GitPanel {
                     }
                 }
 
-                tree_state
-                    .expanded_dirs
-                    .retain(|key, _| seen_directories.contains(key));
+                if !is_filtered {
+                    tree_state
+                        .expanded_dirs
+                        .retain(|key, _| seen_directories.contains(key));
+                }
                 self.tree_expanded_dirs = tree_state.expanded_dirs.clone();
                 self.view_mode = GitPanelViewMode::Tree(tree_state);
             }
@@ -7036,6 +7129,48 @@ impl GitPanel {
                         .child(self.render_view_options_menu("view_options_menu"))
                         .child(self.render_git_changes_actions_button(cx)),
                 )
+                .into_any_element(),
+        )
+    }
+
+    fn render_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(self.git_access, Some(GitAccess::No)) {
+            return None;
+        }
+        self.active_repository.as_ref()?;
+
+        let has_query = !self.filter_editor.read(cx).is_empty(cx);
+        if self.entries.is_empty() && !has_query {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .h(Tab::container_height(cx))
+                .w_full()
+                .pl_2p5()
+                .pr_2()
+                .flex_none()
+                .gap_1p5()
+                .border_y_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1().min_w_0().child(self.filter_editor.clone()))
+                .when(has_query, |this| {
+                    this.child(
+                        IconButton::new("clear-changes-filter", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Clear Filter"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.filter_editor
+                                    .update(cx, |editor, cx| editor.set_text("", window, cx));
+                            })),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -8147,6 +8282,11 @@ impl GitPanel {
         let content = match (self.git_access, &self.active_repository) {
             (Some(GitAccess::No), Some(repository)) => self.render_unsafe_repo_ui(repository, cx),
             (_, None) => self.render_uninitialized_ui(cx),
+            (_, Some(_)) if self.changes_filter.is_some() => {
+                Label::new("No changed files match the filter")
+                    .color(Color::Muted)
+                    .into_any_element()
+            }
             (_, Some(_)) => self
                 .render_branch_review_empty_ui(cx)
                 .unwrap_or_else(|| self.render_no_changes_ui(cx)),
@@ -9774,6 +9914,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::view_unstaged_changes))
             .on_action(cx.listener(Self::view_staged_changes))
             .on_action(cx.listener(Self::focus_changes_list))
+            .on_action(cx.listener(Self::focus_filter))
+            .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))
             .on_action(cx.listener(Self::toggle_commit_editor))
@@ -9803,6 +9945,9 @@ impl Render for GitPanel {
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
                             .children(self.render_changes_header(window, cx))
+                            .when(!self.commit_editor_expanded, |this| {
+                                this.children(self.render_filter(cx))
+                            })
                             .when(!self.commit_editor_expanded, |this| {
                                 this.map(|this| {
                                     if let Some(repo) = self.active_repository.clone()
@@ -14270,6 +14415,128 @@ mod tests {
                 .and_then(GitListEntry::status_entry)
                 .expect("the first visible file should be selected");
             assert_eq!(selected_entry.repo_path, repo_path("modified.rs"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_changes_filter(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project": {
+                    ".git": {},
+                    "db": {
+                        "schema.sql": "create table a();",
+                        "seed.SQL": "insert into a values ();"
+                    },
+                    "src": {
+                        "main.rs": "fn main() {}",
+                        "queries.rs": "const Q: &str = \"\";"
+                    },
+                    "README.md": "readme"
+                }
+            }),
+        )
+        .await;
+
+        fs.set_status_for_repo(
+            Path::new(path!("/root/project/.git")),
+            &[
+                ("db/schema.sql", StatusCode::Modified.worktree()),
+                ("db/seed.SQL", StatusCode::Modified.worktree()),
+                ("src/main.rs", StatusCode::Modified.worktree()),
+                ("src/queries.rs", StatusCode::Modified.worktree()),
+                ("README.md", StatusCode::Modified.worktree()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/root/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        let visible_paths = |query: &str, cx: &mut VisualTestContext| {
+            panel.update_in(cx, |panel, window, cx| {
+                panel
+                    .filter_editor
+                    .update(cx, |editor, cx| editor.set_text(query, window, cx));
+            });
+            cx.executor().run_until_parked();
+            panel.read_with(cx, |panel, _| {
+                let mut paths = panel
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.status_entry())
+                    .map(|entry| entry.repo_path.as_unix_str().to_string())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                paths
+            })
+        };
+
+        assert_eq!(
+            visible_paths("", cx),
+            [
+                "README.md",
+                "db/schema.sql",
+                "db/seed.SQL",
+                "src/main.rs",
+                "src/queries.rs"
+            ]
+        );
+        assert_eq!(visible_paths(".sql", cx), ["db/schema.sql", "db/seed.SQL"]);
+        assert_eq!(visible_paths("src/", cx), ["src/main.rs", "src/queries.rs"]);
+        assert_eq!(visible_paths("*.rs", cx), ["src/main.rs", "src/queries.rs"]);
+        assert_eq!(visible_paths("db/*.sql", cx), ["db/schema.sql"]);
+        assert!(visible_paths("nothing", cx).is_empty());
+        assert_eq!(visible_paths(" ", cx).len(), 5);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel
+                .filter_editor
+                .update(cx, |editor, cx| editor.set_text("main", window, cx));
+            panel.clear_filter(&ClearFilter, window, cx);
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(panel.changes_filter.is_none());
+            assert!(panel.filter_editor.read(cx).is_empty(cx));
+            assert_eq!(
+                panel
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.status_entry())
+                    .count(),
+                5
+            );
         });
     }
 
